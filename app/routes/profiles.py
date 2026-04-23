@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import func
+from sqlalchemy import func, asc, desc
 from app.database import get_db
 from app.models import Profile
 from app.schemas import ProfileCreate, ProfileResponse, ProfileListItem
@@ -290,18 +290,19 @@ def _apply_sorting(stmt, sort_by, order):
                 status_code=400,
                 detail={"status": "error", "message": "Invalid query parameters"},
             )
-        if order not in VALID_ORDERS:
+        if order.lower() not in VALID_ORDERS:
             raise HTTPException(
                 status_code=400,
                 detail={"status": "error", "message": "Invalid query parameters"},
             )
+        # use getattr so created_at and gender_probability resolve correctly
         col = getattr(Profile, sort_by)
-        stmt = stmt.order_by(col.asc() if order == "asc" else col.desc())
+        stmt = stmt.order_by(asc(col) if order.lower() == "asc" else desc(col))
     return stmt
 
 
 def _parse_nl_query(q: str) -> dict:
-    text = q.lower().strip()
+    text = q.strip().lower()
     if not text:
         raise HTTPException(
             status_code=400,
@@ -310,15 +311,15 @@ def _parse_nl_query(q: str) -> dict:
 
     filters = {}
 
-    # ── Gender ───────────────────────────────────────────────────────────────
+    # ── Gender — check combined first, then individual ────────────────────
     if "male and female" in text or "female and male" in text:
-        pass  # both → no gender filter
+        pass  # no gender filter
     elif "female" in text:
         filters["gender"] = "female"
     elif "male" in text:
         filters["gender"] = "male"
 
-    # ── Age group keywords ───────────────────────────────────────────────────
+    # ── Age group keywords ────────────────────────────────────────────────
     if "teenager" in text or "teenagers" in text:
         filters["age_group"] = "teenager"
     elif "child" in text or "children" in text:
@@ -328,15 +329,16 @@ def _parse_nl_query(q: str) -> dict:
     elif "adult" in text or "adults" in text:
         filters["age_group"] = "adult"
     elif "young" in text:
+        # "young" = 16–24, NOT a stored age_group
         filters["min_age"] = 16
         filters["max_age"] = 24
 
-    # ── Explicit age comparisons ─────────────────────────────────────────────
+    # ── Explicit age comparisons ──────────────────────────────────────────
+    between_match = re.search(r"between\s+(\d+)\s+and\s+(\d+)", text)
     above_match = re.search(r"above\s+(\d+)", text)
     below_match = re.search(r"below\s+(\d+)", text)
     over_match = re.search(r"over\s+(\d+)", text)
     under_match = re.search(r"under\s+(\d+)", text)
-    between_match = re.search(r"between\s+(\d+)\s+and\s+(\d+)", text)
 
     if between_match:
         filters["min_age"] = int(between_match.group(1))
@@ -351,7 +353,8 @@ def _parse_nl_query(q: str) -> dict:
         if under_match:
             filters["max_age"] = int(under_match.group(1))
 
-    # ── Country ──────────────────────────────────────────────────────────────
+    # ── Country — longest match wins to avoid false partial matches ───────
+    # first try "from <country>" pattern
     from_match = re.search(
         r"from\s+([a-z\s]+?)(?:\s+(?:above|below|over|under|between|aged?|who|with|where)|$)",
         text,
@@ -360,13 +363,16 @@ def _parse_nl_query(q: str) -> dict:
         country_raw = from_match.group(1).strip().rstrip(".,")
         code = COUNTRY_NAME_TO_CODE.get(country_raw)
         if not code:
-            for name, iso in COUNTRY_NAME_TO_CODE.items():
+            for name, iso in sorted(
+                COUNTRY_NAME_TO_CODE.items(), key=lambda x: -len(x[0])
+            ):
                 if name in country_raw or country_raw in name:
                     code = iso
                     break
         if code:
             filters["country_id"] = code
     else:
+        # fallback: scan full text for any known country name
         for name, iso in sorted(COUNTRY_NAME_TO_CODE.items(), key=lambda x: -len(x[0])):
             if name in text:
                 filters["country_id"] = iso
@@ -387,7 +393,6 @@ def _parse_nl_query(q: str) -> dict:
 @router.post("", status_code=201)
 async def create_profile(body: ProfileCreate, db: AsyncSession = Depends(get_db)):
     name = body.name.strip()
-
     if not name:
         raise HTTPException(
             status_code=400, detail={"status": "error", "message": "Name is required"}
@@ -397,7 +402,6 @@ async def create_profile(body: ProfileCreate, db: AsyncSession = Depends(get_db)
         select(Profile).where(func.lower(Profile.name) == name.lower())
     )
     existing = result.scalar_one_or_none()
-
     if existing:
         return {
             "status": "success",
@@ -406,23 +410,19 @@ async def create_profile(body: ProfileCreate, db: AsyncSession = Depends(get_db)
         }
 
     enriched = await fetch_all(name)
-
     profile = Profile(
         id=str(uuid7()),
         name=name.lower(),
         created_at=datetime.now(timezone.utc),
         **enriched
     )
-
     db.add(profile)
     await db.commit()
     await db.refresh(profile)
-
     return {"status": "success", "data": ProfileResponse.model_validate(profile)}
 
 
-# NOTE: /search must be defined BEFORE /{id} so FastAPI doesn't treat
-# the literal string "search" as a profile ID.
+# NOTE: /search must be defined BEFORE /{id}
 @router.get("/search")
 async def search_profiles(
     q: str = Query(..., min_length=1),
@@ -461,7 +461,6 @@ async def search_profiles(
 
 @router.get("")
 async def list_profiles(
-    # filters
     gender: Optional[str] = Query(None),
     age_group: Optional[str] = Query(None),
     country_id: Optional[str] = Query(None),
@@ -469,10 +468,8 @@ async def list_profiles(
     max_age: Optional[int] = Query(None, ge=0),
     min_gender_probability: Optional[float] = Query(None, ge=0.0, le=1.0),
     min_country_probability: Optional[float] = Query(None, ge=0.0, le=1.0),
-    # sorting
     sort_by: Optional[str] = Query(None),
     order: str = Query("asc"),
-    # pagination
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=50),
     db: AsyncSession = Depends(get_db),
@@ -509,12 +506,10 @@ async def list_profiles(
 async def get_profile(id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Profile).where(Profile.id == id))
     profile = result.scalar_one_or_none()
-
     if not profile:
         raise HTTPException(
             status_code=404, detail={"status": "error", "message": "Profile not found"}
         )
-
     return {"status": "success", "data": ProfileResponse.model_validate(profile)}
 
 
@@ -522,12 +517,10 @@ async def get_profile(id: str, db: AsyncSession = Depends(get_db)):
 async def delete_profile(id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Profile).where(Profile.id == id))
     profile = result.scalar_one_or_none()
-
     if not profile:
         raise HTTPException(
             status_code=404, detail={"status": "error", "message": "Profile not found"}
         )
-
     await db.delete(profile)
     await db.commit()
     return Response(status_code=204)
