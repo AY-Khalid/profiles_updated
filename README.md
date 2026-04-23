@@ -8,7 +8,7 @@ Built with FastAPI, SQLAlchemy, and PostgreSQL.
 
 ## Live API
 
-**Base URL:** `https://your-deployed-url.up.railway.app`
+**Base URL:** `https://profilesupdated-production.up.railway.app/`
 
 ---
 
