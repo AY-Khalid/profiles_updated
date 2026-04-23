@@ -42,4 +42,4 @@ class ProfileListResponse(BaseModel):
     page: int
     limit: int
     total: int
-    data: List[ProfileListItem]
+    data: list[ProfileListItem]
