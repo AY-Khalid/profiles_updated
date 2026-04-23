@@ -295,13 +295,19 @@ def _apply_sorting(stmt, sort_by, order):
                 status_code=400,
                 detail={"status": "error", "message": "Invalid query parameters"},
             )
-        # use getattr so created_at and gender_probability resolve correctly
-        col = getattr(Profile, sort_by)
+        # Map explicitly instead of using getattr to avoid ORM attribute issues
+        sort_column_map = {
+            "age": Profile.age,
+            "created_at": Profile.created_at,
+            "gender_probability": Profile.gender_probability,
+        }
+        col = sort_column_map[sort_by]
         stmt = stmt.order_by(asc(col) if order.lower() == "asc" else desc(col))
     return stmt
 
 
 def _parse_nl_query(q: str) -> dict:
+    # lowercase AFTER saving original, so capital M in "Male" is handled
     text = q.strip().lower()
     if not text:
         raise HTTPException(
@@ -311,15 +317,16 @@ def _parse_nl_query(q: str) -> dict:
 
     filters = {}
 
-    # ── Gender — check combined first, then individual ────────────────────
+    # ── Gender ────────────────────────────────────────────────────────────
+    # Check combined FIRST before individual to avoid partial matches
     if "male and female" in text or "female and male" in text:
-        pass  # no gender filter
+        pass  # no gender filter — both genders
     elif "female" in text:
         filters["gender"] = "female"
     elif "male" in text:
         filters["gender"] = "male"
 
-    # ── Age group keywords ────────────────────────────────────────────────
+    # ── Age group — check BEFORE "young" since young is a fallback ────────
     if "teenager" in text or "teenagers" in text:
         filters["age_group"] = "teenager"
     elif "child" in text or "children" in text:
@@ -328,12 +335,13 @@ def _parse_nl_query(q: str) -> dict:
         filters["age_group"] = "senior"
     elif "adult" in text or "adults" in text:
         filters["age_group"] = "adult"
-    elif "young" in text:
-        # "young" = 16–24, NOT a stored age_group
+
+    # "young" sets min/max age — independent of age_group block above
+    if "young" in text and "age_group" not in filters:
         filters["min_age"] = 16
         filters["max_age"] = 24
 
-    # ── Explicit age comparisons ──────────────────────────────────────────
+    # ── Explicit age comparisons — always run, can combine with age_group ─
     between_match = re.search(r"between\s+(\d+)\s+and\s+(\d+)", text)
     above_match = re.search(r"above\s+(\d+)", text)
     below_match = re.search(r"below\s+(\d+)", text)
@@ -346,15 +354,14 @@ def _parse_nl_query(q: str) -> dict:
     else:
         if above_match:
             filters["min_age"] = int(above_match.group(1))
-        if over_match:
+        if over_match and "min_age" not in filters:
             filters["min_age"] = int(over_match.group(1))
         if below_match:
             filters["max_age"] = int(below_match.group(1))
-        if under_match:
+        if under_match and "max_age" not in filters:
             filters["max_age"] = int(under_match.group(1))
 
-    # ── Country — longest match wins to avoid false partial matches ───────
-    # first try "from <country>" pattern
+    # ── Country ───────────────────────────────────────────────────────────
     from_match = re.search(
         r"from\s+([a-z\s]+?)(?:\s+(?:above|below|over|under|between|aged?|who|with|where)|$)",
         text,
@@ -372,7 +379,6 @@ def _parse_nl_query(q: str) -> dict:
         if code:
             filters["country_id"] = code
     else:
-        # fallback: scan full text for any known country name
         for name, iso in sorted(COUNTRY_NAME_TO_CODE.items(), key=lambda x: -len(x[0])):
             if name in text:
                 filters["country_id"] = iso
@@ -499,7 +505,7 @@ async def list_profiles(
         "limit": limit,
         "total": total,
         "data": [ProfileListItem.model_validate(p) for p in results],
-    }
+     }
 
 
 @router.get("/{id}")
