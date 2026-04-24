@@ -64,5 +64,6 @@ async def fetch_all(name: str) -> dict:
         "age": age,
         "age_group": classify_age(age),
         "country_id": top_country["country_id"],
+        "country_name": COUNTRY_NAMES.get(top_country["country_id"], top_country["country_id"]),
         "country_probability": top_country["probability"],
     }
