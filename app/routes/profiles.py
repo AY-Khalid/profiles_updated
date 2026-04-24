@@ -283,7 +283,6 @@ def _apply_filters(
     return stmt
 
 
-
 def _apply_sorting(stmt, sort_by, order):
     if sort_by is not None:
         if sort_by not in VALID_SORT_FIELDS:
@@ -291,26 +290,24 @@ def _apply_sorting(stmt, sort_by, order):
                 status_code=400,
                 detail={"status": "error", "message": "Invalid query parameters"},
             )
-        # Fix: order should default to "asc" but we need to validate it properly
-        order_lower = order.lower() if order else "asc"
-        if order_lower not in VALID_ORDERS:
+        if order.lower() not in VALID_ORDERS:
             raise HTTPException(
                 status_code=400,
                 detail={"status": "error", "message": "Invalid query parameters"},
             )
-     
+        # Map explicitly instead of using getattr to avoid ORM attribute issues
         sort_column_map = {
             "age": Profile.age,
             "created_at": Profile.created_at,
             "gender_probability": Profile.gender_probability,
         }
         col = sort_column_map[sort_by]
-        stmt = stmt.order_by(asc(col) if order_lower == "asc" else desc(col))
+        stmt = stmt.order_by(asc(col) if order.lower() == "asc" else desc(col))
     return stmt
 
 
-
 def _parse_nl_query(q: str) -> dict:
+    # lowercase AFTER saving original, so capital M in "Male" is handled
     text = q.strip().lower()
     if not text:
         raise HTTPException(
@@ -320,43 +317,31 @@ def _parse_nl_query(q: str) -> dict:
 
     filters = {}
 
-    # ── Gender parsing (more robust) ─────────────────────────────────────
-    # Handle "Male and female", "both genders", etc.
-    if "male and female" in text or "female and male" in text or "both" in text:
-        pass  # No gender filter - include all
+    # ── Gender ────────────────────────────────────────────────────────────
+    # Check combined FIRST before individual to avoid partial matches
+    if "male and female" in text or "female and male" in text:
+        pass  # no gender filter — both genders
     elif "female" in text:
         filters["gender"] = "female"
     elif "male" in text:
         filters["gender"] = "male"
 
-    # ── Age group parsing ────────────────────────────────────────────────
-    # Handle "teenagers", "young", "adult", "senior", "child"
-    age_group_set = False
-    
-    if "teenager" in text or "teenagers" in text or "teens" in text:
+    # ── Age group — check BEFORE "young" since young is a fallback ────────
+    if "teenager" in text or "teenagers" in text:
         filters["age_group"] = "teenager"
-        age_group_set = True
-    elif "child" in text or "children" in text or "kid" in text or "kids" in text:
+    elif "child" in text or "children" in text:
         filters["age_group"] = "child"
-        age_group_set = True
-    elif "senior" in text or "seniors" in text or "elderly" in text or "old" in text:
+    elif "senior" in text or "seniors" in text or "elderly" in text:
         filters["age_group"] = "senior"
-        age_group_set = True
     elif "adult" in text or "adults" in text:
         filters["age_group"] = "adult"
-        age_group_set = True
-    
-    # Handle "young" - this sets age range, not age_group
-    if "young" in text and not age_group_set:
-        # Young typically means 18-30
-        filters["min_age"] = 18
-        filters["max_age"] = 30
-    elif "young" in text and age_group_set:
-        # If we have age_group and "young", we keep age_group but might adjust
-        pass
 
-    # ── Explicit age ranges ──────────────────────────────────────────────
-    # Handle "above 17", "over 18", "under 21", "below 30", "between X and Y"
+    # "young" sets min/max age — independent of age_group block above
+    if "young" in text and "age_group" not in filters:
+        filters["min_age"] = 16
+        filters["max_age"] = 24
+
+    # ── Explicit age comparisons — always run, can combine with age_group ─
     between_match = re.search(r"between\s+(\d+)\s+and\s+(\d+)", text)
     above_match = re.search(r"above\s+(\d+)", text)
     below_match = re.search(r"below\s+(\d+)", text)
@@ -368,63 +353,36 @@ def _parse_nl_query(q: str) -> dict:
         filters["max_age"] = int(between_match.group(2))
     else:
         if above_match:
-            filters["min_age"] = int(above_match.group(1)) + 1
+            filters["min_age"] = int(above_match.group(1))
         if over_match and "min_age" not in filters:
-            filters["min_age"] = int(over_match.group(1)) + 1
+            filters["min_age"] = int(over_match.group(1))
         if below_match:
-            filters["max_age"] = int(below_match.group(1)) - 1
+            filters["max_age"] = int(below_match.group(1))
         if under_match and "max_age" not in filters:
-            filters["max_age"] = int(under_match.group(1)) - 1
+            filters["max_age"] = int(under_match.group(1))
 
-    # ── Country parsing (improved) ───────────────────────────────────────
-    # Look for "from X" pattern
-    from_match = re.search(r"from\s+([a-z\s]+?)(?:\s+(?:above|below|over|under|between|aged?|who|with|where|and|$))", text)
+    # ── Country ───────────────────────────────────────────────────────────
+    from_match = re.search(
+        r"from\s+([a-z\s]+?)(?:\s+(?:above|below|over|under|between|aged?|who|with|where)|$)",
+        text,
+    )
     if from_match:
         country_raw = from_match.group(1).strip().rstrip(".,")
-        # Try direct lookup
         code = COUNTRY_NAME_TO_CODE.get(country_raw)
         if not code:
-            # Try partial match
-            for name, iso in sorted(COUNTRY_NAME_TO_CODE.items(), key=lambda x: -len(x[0])):
+            for name, iso in sorted(
+                COUNTRY_NAME_TO_CODE.items(), key=lambda x: -len(x[0])
+            ):
                 if name in country_raw or country_raw in name:
                     code = iso
                     break
         if code:
             filters["country_id"] = code
     else:
-        # Look for country names anywhere in the text
         for name, iso in sorted(COUNTRY_NAME_TO_CODE.items(), key=lambda x: -len(x[0])):
             if name in text:
                 filters["country_id"] = iso
                 break
-
-    # Handle specific test case: "young males"
-    if "young" in text and "male" in text and "age_group" not in filters and "min_age" not in filters:
-        filters["min_age"] = 18
-        filters["max_age"] = 30
-        if "gender" not in filters:
-            filters["gender"] = "male"
-    
-    # Handle: "adult males from kenya"
-    if "adult" in text and "males" in text and "kenya" in text:
-        if "age_group" not in filters:
-            filters["age_group"] = "adult"
-        if "gender" not in filters:
-            filters["gender"] = "male"
-        if "country_id" not in filters:
-            filters["country_id"] = "KE"
-    
-    # Handle: "Male and female teenagers above 17"
-    if "male and female" in text and ("teenager" in text or "teenagers" in text):
-        # No gender filter (both genders), but age_group = teenager
-        if "gender" in filters:
-            del filters["gender"]  # Remove gender filter for this case
-        if "age_group" not in filters:
-            filters["age_group"] = "teenager"
-        # Check for age condition
-        above_match_age = re.search(r"above\s+(\d+)", text)
-        if above_match_age:
-            filters["min_age"] = int(above_match_age.group(1))
 
     if not filters:
         raise HTTPException(
@@ -470,12 +428,12 @@ async def create_profile(body: ProfileCreate, db: AsyncSession = Depends(get_db)
     return {"status": "success", "data": ProfileResponse.model_validate(profile)}
 
 
-
+# NOTE: /search must be defined BEFORE /{id}
 @router.get("/search")
 async def search_profiles(
     q: str = Query(..., min_length=1),
     page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=100),
+    limit: int = Query(10, ge=1, le=50),
     db: AsyncSession = Depends(get_db),
 ):
     filters = _parse_nl_query(q)
@@ -519,7 +477,7 @@ async def list_profiles(
     sort_by: Optional[str] = Query(None),
     order: str = Query("asc"),
     page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=100),
+    limit: int = Query(10, ge=1, le=50),
     db: AsyncSession = Depends(get_db),
 ):
     stmt = select(Profile)
@@ -541,20 +499,13 @@ async def list_profiles(
     offset = (page - 1) * limit
     results = (await db.execute(stmt.offset(offset).limit(limit))).scalars().all()
 
-    # Replace the return statement in list_profiles function
-
     return {
         "status": "success",
-        "data": {
-            "items": [ProfileListItem.model_validate(p) for p in results],
-            "pagination": {
-                "current_page": page,
-                "per_page": limit,
-                "total_items": total,
-                "total_pages": (total + limit - 1) // limit if total > 0 else 0
-            }
-        }
-    }
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "data": [ProfileListItem.model_validate(p) for p in results],
+     }
 
 
 @router.get("/{id}")
