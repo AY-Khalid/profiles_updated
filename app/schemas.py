@@ -1,11 +1,9 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
-
 
 class ProfileCreate(BaseModel):
     name: str
-
 
 class ProfileResponse(BaseModel):
     id: str
@@ -23,7 +21,6 @@ class ProfileResponse(BaseModel):
     class Config:
         from_attributes = True
 
-
 class ProfileListItem(BaseModel):
     id: str
     name: str
@@ -31,15 +28,17 @@ class ProfileListItem(BaseModel):
     age: Optional[int]
     age_group: Optional[str]
     country_id: Optional[str]
-    country_name: Optional[str]
 
     class Config:
         from_attributes = True
 
 
-class ProfileListResponse(BaseModel):
-    status: str
+class PaginationMeta(BaseModel):
     page: int
     limit: int
     total: int
-    data: list[ProfileListItem]
+
+class ProfileListResponse(BaseModel):
+    status: str
+    data: List[ProfileListItem]
+    pagination: PaginationMeta  

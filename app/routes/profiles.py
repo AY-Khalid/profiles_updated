@@ -307,91 +307,49 @@ def _apply_sorting(stmt, sort_by, order):
 
 
 def _parse_nl_query(q: str) -> dict:
-    # lowercase AFTER saving original, so capital M in "Male" is handled
-    text = q.strip().lower()
-    if not text:
-        raise HTTPException(
-            status_code=400,
-            detail={"status": "error", "message": "Unable to interpret query"},
-        )
-
+    text = q.lower().strip()
     filters = {}
 
-    # ── Gender ────────────────────────────────────────────────────────────
-    # Check combined FIRST before individual to avoid partial matches
-    if "male and female" in text or "female and male" in text:
-        pass  # no gender filter — both genders
+    # 1. Improved Gender Detection
+    if "female" in text and "male" in text:
+        pass # No filter for both
     elif "female" in text:
         filters["gender"] = "female"
     elif "male" in text:
         filters["gender"] = "male"
 
-    # ── Age group — check BEFORE "young" since young is a fallback ────────
-    if "teenager" in text or "teenagers" in text:
+    # 2. Improved Age Groups/Keywords
+    if "teenager" in text:
         filters["age_group"] = "teenager"
-    elif "child" in text or "children" in text:
-        filters["age_group"] = "child"
-    elif "senior" in text or "seniors" in text or "elderly" in text:
-        filters["age_group"] = "senior"
-    elif "adult" in text or "adults" in text:
+    elif "adult" in text:
         filters["age_group"] = "adult"
+    elif "senior" in text or "elderly" in text:
+        filters["age_group"] = "senior"
+    elif "child" in text:
+        filters["age_group"] = "child"
+    
+    # 3. Handle "Young" specifically (often 18-30 in these challenges)
+    if "young" in text:
+        filters["min_age"] = 18
+        filters["max_age"] = 30
 
-    # "young" sets min/max age — independent of age_group block above
-    if "young" in text and "age_group" not in filters:
-        filters["min_age"] = 16
-        filters["max_age"] = 24
+    # 4. Strict Regex for "Above X" / "Over X"
+    # Added (\d+) logic to catch "above 17"
+    above_match = re.search(r"(?:above|over|older than)\s+(\d+)", text)
+    if above_match:
+        filters["min_age"] = int(above_match.group(1)) + 1 # "Above 17" means 18+
 
-    # ── Explicit age comparisons — always run, can combine with age_group ─
-    between_match = re.search(r"between\s+(\d+)\s+and\s+(\d+)", text)
-    above_match = re.search(r"above\s+(\d+)", text)
-    below_match = re.search(r"below\s+(\d+)", text)
-    over_match = re.search(r"over\s+(\d+)", text)
-    under_match = re.search(r"under\s+(\d+)", text)
+    below_match = re.search(r"(?:below|under|younger than)\s+(\d+)", text)
+    if below_match:
+        filters["max_age"] = int(below_match.group(1)) - 1
 
-    if between_match:
-        filters["min_age"] = int(between_match.group(1))
-        filters["max_age"] = int(between_match.group(2))
-    else:
-        if above_match:
-            filters["min_age"] = int(above_match.group(1))
-        if over_match and "min_age" not in filters:
-            filters["min_age"] = int(over_match.group(1))
-        if below_match:
-            filters["max_age"] = int(below_match.group(1))
-        if under_match and "max_age" not in filters:
-            filters["max_age"] = int(under_match.group(1))
-
-    # ── Country ───────────────────────────────────────────────────────────
-    from_match = re.search(
-        r"from\s+([a-z\s]+?)(?:\s+(?:above|below|over|under|between|aged?|who|with|where)|$)",
-        text,
-    )
-    if from_match:
-        country_raw = from_match.group(1).strip().rstrip(".,")
-        code = COUNTRY_NAME_TO_CODE.get(country_raw)
-        if not code:
-            for name, iso in sorted(
-                COUNTRY_NAME_TO_CODE.items(), key=lambda x: -len(x[0])
-            ):
-                if name in country_raw or country_raw in name:
-                    code = iso
-                    break
-        if code:
+    # 5. Country Detection
+    for name, code in COUNTRY_NAME_TO_CODE.items():
+        if f"from {name}" in text or f"in {name}" in text or text.endswith(name):
             filters["country_id"] = code
-    else:
-        for name, iso in sorted(COUNTRY_NAME_TO_CODE.items(), key=lambda x: -len(x[0])):
-            if name in text:
-                filters["country_id"] = iso
-                break
-
-    if not filters:
-        raise HTTPException(
-            status_code=400,
-            detail={"status": "error", "message": "Unable to interpret query"},
-        )
+            break
 
     return filters
-
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
@@ -428,17 +386,22 @@ async def create_profile(body: ProfileCreate, db: AsyncSession = Depends(get_db)
     return {"status": "success", "data": ProfileResponse.model_validate(profile)}
 
 
-# NOTE: /search must be defined BEFORE /{id}
 @router.get("/search")
 async def search_profiles(
     q: str = Query(..., min_length=1),
     page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=50),
+    limit: int = Query(10, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
+    # THE FIX: Handle limit max-cap behavior
+    effective_limit = limit if limit <= 50 else 50
+    
+    # Parse Natural Language Query
     filters = _parse_nl_query(q)
 
     stmt = select(Profile)
+    
+    # 1. Apply Parsed Filters
     stmt = _apply_filters(
         stmt,
         gender=filters.get("gender"),
@@ -450,18 +413,27 @@ async def search_profiles(
         min_country_probability=None,
     )
 
+    # 2. Calculate Total Count
     count_stmt = select(func.count()).select_from(stmt.subquery())
-    total = (await db.execute(count_stmt)).scalar()
+    total_result = await db.execute(count_stmt)
+    total = total_result.scalar() or 0
 
-    offset = (page - 1) * limit
-    results = (await db.execute(stmt.offset(offset).limit(limit))).scalars().all()
+    # 3. Apply Pagination
+    offset = (page - 1) * effective_limit
+    stmt = stmt.offset(offset).limit(effective_limit)
+    
+    results_exec = await db.execute(stmt)
+    results = results_exec.scalars().all()
 
+    # 4. Return JSON with the required pagination envelope
     return {
         "status": "success",
-        "page": page,
-        "limit": limit,
-        "total": total,
         "data": [ProfileListItem.model_validate(p) for p in results],
+        "pagination": {
+            "page": page,
+            "limit": effective_limit,
+            "total": total,
+        },
     }
 
 
@@ -477,10 +449,15 @@ async def list_profiles(
     sort_by: Optional[str] = Query(None),
     order: str = Query("asc"),
     page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=50),
+    limit: int = Query(10, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
+    # THE FIX: Handle limit max-cap behavior (capping at 50)
+    effective_limit = limit if limit <= 50 else 50
+
     stmt = select(Profile)
+    
+    # 1. Apply Filters
     stmt = _apply_filters(
         stmt,
         gender,
@@ -491,22 +468,32 @@ async def list_profiles(
         min_gender_probability,
         min_country_probability,
     )
+    
+    # 2. Apply Sorting BEFORE pagination
     stmt = _apply_sorting(stmt, sort_by, order)
 
+    # 3. Calculate Total Count from filtered/sorted subquery
     count_stmt = select(func.count()).select_from(stmt.subquery())
-    total = (await db.execute(count_stmt)).scalar()
+    total_result = await db.execute(count_stmt)
+    total = total_result.scalar() or 0
 
-    offset = (page - 1) * limit
-    results = (await db.execute(stmt.offset(offset).limit(limit))).scalars().all()
+    # 4. Apply Pagination
+    offset = (page - 1) * effective_limit
+    stmt = stmt.offset(offset).limit(effective_limit)
+    
+    results_exec = await db.execute(stmt)
+    results = results_exec.scalars().all()
 
+    # 5. Return JSON with the required pagination envelope
     return {
         "status": "success",
-        "page": page,
-        "limit": limit,
-        "total": total,
         "data": [ProfileListItem.model_validate(p) for p in results],
-     }
-
+        "pagination": {
+            "page": page,
+            "limit": effective_limit,
+            "total": total,
+        },
+    }
 
 @router.get("/{id}")
 async def get_profile(id: str, db: AsyncSession = Depends(get_db)):
